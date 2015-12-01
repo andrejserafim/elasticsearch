@@ -53,7 +53,7 @@ public class MetaDataMappingService extends AbstractComponent {
     private final ClusterService clusterService;
     private final IndicesService indicesService;
 
-    final ClusterStateTaskExecutor<RefreshTask> refreshExectuor = new RefreshTaskExecutor();
+    final ClusterStateTaskExecutor<RefreshTask> refreshExecutor = new RefreshTaskExecutor();
     final ClusterStateTaskExecutor<PutMappingClusterStateUpdateRequest> putMappingExecutor = new PutMappingExecutor();
     private final NodeServicesProvider nodeServicesProvider;
 
@@ -211,19 +211,18 @@ public class MetaDataMappingService extends AbstractComponent {
     public void refreshMapping(final String index, final String indexUUID, final String... types) {
         final RefreshTask refreshTask = new RefreshTask(index, indexUUID, types);
         clusterService.submitStateUpdateTask("refresh-mapping [" + index + "][" + Arrays.toString(types) + "]",
-                refreshTask,
-                ClusterStateTaskConfig.build(Priority.HIGH),
-                refreshExectuor,
-                (source, t) -> logger.warn("failure during [{}]", t, source)
+            refreshTask,
+            ClusterStateTaskConfig.build(Priority.HIGH),
+            refreshExecutor,
+            (source, t) -> logger.warn("failure during [{}]", t, source)
         );
     }
 
     class PutMappingExecutor implements ClusterStateTaskExecutor<PutMappingClusterStateUpdateRequest> {
         @Override
         public BatchResult<PutMappingClusterStateUpdateRequest> execute(ClusterState currentState, List<PutMappingClusterStateUpdateRequest> tasks) throws Exception {
-            List<String> indicesToClose = new ArrayList<>();
+            Set<String> indicesToClose = new HashSet<>();
             BatchResult.Builder<PutMappingClusterStateUpdateRequest> builder = BatchResult.builder();
-            Map<PutMappingClusterStateUpdateRequest, TaskResult> executionResults = new HashMap<>();
             try {
                 // precreate incoming indices;
                 for (PutMappingClusterStateUpdateRequest request : tasks) {
@@ -231,16 +230,22 @@ public class MetaDataMappingService extends AbstractComponent {
                     for (String index : request.indices()) {
                         if (currentState.metaData().hasIndex(index)) {
                             // if we don't have the index, we will throw exceptions later;
-                            if (indicesService.hasIndex(index) == false) {
+                            if (indicesService.hasIndex(index) == false || indicesToClose.contains(index)) {
                                 final IndexMetaData indexMetaData = currentState.metaData().index(index);
-                                IndexService indexService = indicesService.createIndex(nodeServicesProvider, indexMetaData, Collections.EMPTY_LIST);
-                                indicesToClose.add(indexMetaData.getIndex());
-                                // make sure to add custom default mapping if exists
-                                if (indexMetaData.getMappings().containsKey(MapperService.DEFAULT_MAPPING)) {
-                                    indexService.mapperService().merge(MapperService.DEFAULT_MAPPING, indexMetaData.getMappings().get(MapperService.DEFAULT_MAPPING).source(), false, request.updateAllTypes());
+                                IndexService indexService;
+                                if (indicesService.hasIndex(index) == false) {
+                                    indicesToClose.add(index);
+                                    indexService = indicesService.createIndex(nodeServicesProvider, indexMetaData, Collections.EMPTY_LIST);
+                                    // make sure to add custom default mapping if exists
+                                    if (indexMetaData.getMappings().containsKey(MapperService.DEFAULT_MAPPING)) {
+                                        indexService.mapperService().merge(MapperService.DEFAULT_MAPPING, indexMetaData.getMappings().get(MapperService.DEFAULT_MAPPING).source(), false, request.updateAllTypes());
+                                    }
+                                } else {
+                                    indexService = indicesService.indexService(index);
                                 }
-                                // only add the current relevant mapping (if exists)
-                                if (indexMetaData.getMappings().containsKey(request.type())) {
+                                // only add the current relevant mapping (if exists and not yet added)
+                                if (indexMetaData.getMappings().containsKey(request.type()) &&
+                                        !indexService.mapperService().hasMapping(request.type())) {
                                     indexService.mapperService().merge(request.type(), indexMetaData.getMappings().get(request.type()).source(), false, request.updateAllTypes());
                                 }
                             }
